@@ -1,0 +1,7 @@
+.agents/
+.codex/
+.git/
+.g-shock.git/
+main/logs/
+**/__pycache__/
+*.pyc
