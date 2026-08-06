@@ -1,0 +1,39 @@
+{
+  "zero_snapshot": {
+    "format_version": 2,
+    "robot_uid": "0046003E3133511832353236",
+    "known_mask": 455,
+    "zero_offset_f32_le_hex": [
+      "f953e3bf",
+      "7f6a843f",
+      "07813540",
+      null,
+      null,
+      null,
+      "1d5a2440",
+      "77bedf3f",
+      "a245c63f",
+      null,
+      null,
+      null
+    ]
+  },
+  "teaching_start_angles_rad": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "motion_sha256": "185dc046c5d351644d8d78ea28df959245debd93d9fdd2e27130ce894c8c78f8",
+  "schema": 2,
+  "slot_id": 2,
+  "updated": "2026-08-07T05:24:47+09:00"
+}

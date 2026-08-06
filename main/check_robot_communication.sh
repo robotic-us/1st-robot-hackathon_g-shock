@@ -4,7 +4,8 @@
 set -u
 
 NIC="${PHORCE_NIC:-eno1}"
-AXES="${PHORCE_AXES:-2}"
+MODE="${PHORCE_MODE:-op_idle}"
+AXES="${PHORCE_AXES:-auto}"
 STARTUP_TIMEOUT="${PHORCE_STARTUP_TIMEOUT:-20}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
@@ -152,7 +153,7 @@ mkdir -p "$LOG_DIR"
 
 progress 3 "피드백 토픽 연결"
 ros2 run agx_phorce_bridge phorce_monitor --ros-args \
-  -p "nic:=${NIC}" -p mode:=command -p "axes:=${AXES}" -p mbx_enabled:=true \
+  -p "nic:=${NIC}" -p "mode:=${MODE}" -p "axes:=${AXES}" -p mbx_enabled:=true \
   >"$MONITOR_LOG" 2>&1 &
 MONITOR_PID=$!
 
