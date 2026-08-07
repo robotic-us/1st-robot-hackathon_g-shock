@@ -20,6 +20,13 @@ from agx_msgs.action import PlayMotionSequence
 from agx_msgs.msg import MotionSlotState, PhorceFeedback
 from agx_msgs.srv import ListMotionSlots
 
+from pcm_usb_servo import (
+    PcmUsbServoClient,
+    SERVO_OFF,
+    SERVO_ON,
+    SERVO_TRANSITION,
+)
+
 
 ACTION = "/motion_action_server/play_motion_sequence"
 FEEDBACK = "/phorce/feedback"
@@ -30,6 +37,7 @@ MOTION_ALIASES = {
     "tape": ("TAPE",),
     "home": ("HOME", "RETURN_HOME", "GO_HOME"),
 }
+PARK_MOTION_ID = 1
 # /phorce/feedback.position_rad reference poses from operator captures.
 # HOME_ZERO_RAD is the unprepared home-zero pose; BUTTON1_READY_RAD is the pose
 # after the physical button-1 sequence. Their separation is only up to 0.006
@@ -85,6 +93,8 @@ class GuardNode(Node):
         self.axes = []
         self.last_frame = 0.0
         self.goal_handle = None
+        self.pending_goal_purpose = None
+        self.goal_purpose = None
         self.motion_state = "대기"
         self.event = "피드백 대기 중"
         self.threshold = 2.0
@@ -106,6 +116,7 @@ class GuardNode(Node):
         self.button1_motion_seen = False
         self.op_away_seen = False
         self.back_home_samples = 0
+        self.pcm_usb = PcmUsbServoClient()
 
     def request_play(self, motion_id, threshold, required_hits):
         self.commands.put(("play", motion_id, threshold, required_hits))
@@ -113,17 +124,45 @@ class GuardNode(Node):
     def request_stop(self):
         self.commands.put(("stop",))
 
+    def request_arm(self):
+        with self.lock:
+            motion_active = self.goal_handle is not None
+        if motion_active:
+            self._set_status(
+                event="활성 모션 중에는 ARM 명령을 보내지 않습니다")
+            return
+        self.pcm_usb.request_servo_on()
+        self._set_status(state="PCM ARM 중", event="USB ARM 명령 요청")
+
+    def request_unarm(self):
+        """Run motion slot 1 to HOME, then remove servo torque on success."""
+        self.commands.put(("park_unarm",))
+
+    def request_servo_off_now(self):
+        """Safety fallback: cancel active motion and remove torque now."""
+        with self.lock:
+            motion_active = self.goal_handle is not None
+        if motion_active:
+            self.request_stop()
+        self.pcm_usb.request_servo_off()
+        self._set_status(
+            state="PCM 즉시 OFF 중", event="홈 복귀 없이 USB 서보 OFF 요청")
+
+    def close(self):
+        self.pcm_usb.close()
+
     def snapshot(self):
         with self.lock:
             return (list(self.axes), self.last_frame, self.motion_state,
                     self.event, self.armed, self.hits, self.threshold,
                     dict(self.motion_catalog), self.catalog_status,
                     self.motion_ready_status, self.peak_axis, self.peak_dob,
-                    self.home_feedback_status, self.operation_mode)
+                    self.home_feedback_status, self.operation_mode,
+                    self.pcm_usb.snapshot())
 
     def _on_motion_state(self, message):
         if message.recovery_required:
-            status = "복구 필요 — 2번 파킹 후 1번 버튼"
+            status = "복구 필요 — 물리 2번 파킹 후 ARM"
             self.motion_ready_seen = False
         elif message.contract_active and message.physical_idle:
             status = "모션 수신 준비 완료"
@@ -131,7 +170,7 @@ class GuardNode(Node):
         elif self.motion_ready_seen:
             status = "현재 모션 실행 중"
         elif message.contract_active:
-            status = "준비 안 됨 — 필요하면 1번 버튼을 0.6초 누르세요"
+            status = "준비 안 됨 — [ARM]을 사용하세요"
         else:
             status = "PCM 상태 계약 비활성"
         with self.lock:
@@ -186,9 +225,11 @@ class GuardNode(Node):
                 self._play(*command[1:])
             elif command[0] == "stop":
                 self._cancel("사용자 정지 요청")
+            elif command[0] == "park_unarm":
+                self._park_and_unarm()
 
-    def _play(self, motion_id, threshold, required_hits):
-        if self.goal_handle is not None:
+    def _play(self, motion_id, threshold, required_hits, purpose="motion"):
+        if self.goal_handle is not None or self.pending_goal_purpose is not None:
             self._set_status(event="이미 활성 모션이 있습니다")
             return
         if not self.client.server_is_ready():
@@ -201,22 +242,51 @@ class GuardNode(Node):
         goal = PlayMotionSequence.Goal()
         goal.motion_ids = [motion_id]
         goal.stop_on_error = True
-        self._set_status(state="요청 중", event=f"모션 {motion_id} 전송")
+        self.pending_goal_purpose = purpose
+        if purpose == "park_unarm":
+            self._set_status(
+                state="HOME 요청 중",
+                event="모션 1 완료 후 서보 OFF 예정")
+        else:
+            self._set_status(state="요청 중", event=f"모션 {motion_id} 전송")
         future = self.client.send_goal_async(goal, feedback_callback=self._on_action_feedback)
         future.add_done_callback(self._on_goal_response)
 
+    def _park_and_unarm(self):
+        if self.goal_handle is not None or self.pending_goal_purpose is not None:
+            self._set_status(
+                state="HOME 대기 실패",
+                event="활성 모션을 먼저 정지한 뒤 HOME → UNARM을 실행하세요")
+            return
+        self._play(PARK_MOTION_ID, self.threshold, self.required_hits,
+                   purpose="park_unarm")
+
     def _on_goal_response(self, future):
+        purpose = self.pending_goal_purpose
+        self.pending_goal_purpose = None
         try:
             handle = future.result()
         except Exception as exc:
-            self._set_status(state="오류", event=f"Goal 전송 실패: {exc}")
+            detail = f"Goal 전송 실패: {exc}"
+            if purpose == "park_unarm":
+                detail += " — 서보 유지"
+            self._set_status(state="오류", event=detail)
             return
         if not handle.accepted:
-            self._set_status(state="거절", event="액션 서버가 Goal을 거절했습니다")
+            detail = "액션 서버가 Goal을 거절했습니다"
+            if purpose == "park_unarm":
+                detail += " — 서보 유지"
+            self._set_status(state="거절", event=detail)
             return
         self.goal_handle = handle
+        self.goal_purpose = purpose
         self.armed = True
-        self._set_status(state="실행 중", event="충격 감시 활성화")
+        if purpose == "park_unarm":
+            self._set_status(
+                state="HOME 모션 1 실행 중",
+                event="완료 확인 전까지 서보 유지 · 충격 감시 활성화")
+        else:
+            self._set_status(state="실행 중", event="충격 감시 활성화")
         result = handle.get_result_async()
         result.add_done_callback(self._on_result)
 
@@ -226,19 +296,34 @@ class GuardNode(Node):
             self._set_status(state=f"모션 {motion_id} 실행 중")
 
     def _on_result(self, future):
+        purpose = self.goal_purpose
+        succeeded = False
         try:
             wrapped = future.result()
             result = wrapped.result
             labels = {0: "완료", 1: "거절", 2: "중단", 3: "취소"}
             state = labels.get(result.status, f"결과 {result.status}")
             detail = result.detail or state
+            succeeded = result.status == 0
         except Exception as exc:
             state, detail = "오류", f"결과 수신 실패: {exc}"
         self.goal_handle = None
+        self.goal_purpose = None
         self.armed = False
         self.cancel_pending = False
         self.hits = 0
-        self._set_status(state=state, event=detail)
+        if purpose == "park_unarm":
+            if succeeded:
+                self.pcm_usb.request_servo_off()
+                self._set_status(
+                    state="HOME 완료 · PCM UNARM 중",
+                    event="모션 1 성공 확인 — USB 서보 OFF 요청")
+            else:
+                self._set_status(
+                    state=f"HOME {state}",
+                    event=f"{detail} — 안전을 위해 서보 유지")
+        else:
+            self._set_status(state=state, event=detail)
 
     def _cancel(self, reason):
         self.armed = False
@@ -368,6 +453,43 @@ class GuardNode(Node):
                 if operation_mode == "BACK TO HOME" and not self.button1_motion_seen:
                     home_status = ("홈 영점 복귀 상태 — 다음 운전 전 "
                                    "1번 버튼이 필요합니다")
+
+            # Fail closed: this PCM exposes an authoritative USB servo state,
+            # so gain/pose inference must never promote a fresh or reconnected
+            # session to OP.  Only a state=SERVO_ON observation from this
+            # process may do that.  None also clears the old OP latch after a
+            # robot power cycle while the GUI remains open.
+            usb = self.pcm_usb.snapshot()
+            if usb.servo_state == SERVO_ON:
+                operation_mode = "OP"
+                self.op_seen = True
+                self.button1_motion_seen = True
+                home_status = "USB 확인 완료 — PCM ARMED, 서보 ON"
+            elif usb.servo_state == SERVO_TRANSITION:
+                operation_mode = "NOT OP"
+                self.op_seen = False
+                self.button1_motion_seen = False
+                self.home_ready_samples = 0
+                home_status = ("USB 확인 — PCM이 부팅 자세로 이동 중입니다. "
+                               "로봇 주변을 비워 두세요")
+            elif usb.servo_state == SERVO_OFF:
+                operation_mode = "NOT OP"
+                self.op_seen = False
+                self.button1_motion_seen = False
+                self.home_ready_samples = 0
+                self.op_away_seen = False
+                self.back_home_samples = 0
+                home_status = ("USB 확인 — PCM UNARMED, 서보 OFF. "
+                               "물리 2번 버튼의 홈 복귀와는 다릅니다")
+            else:
+                operation_mode = "NOT OP"
+                self.op_seen = False
+                self.button1_motion_seen = False
+                self.home_ready_samples = 0
+                self.op_away_seen = False
+                self.back_home_samples = 0
+                home_status = ("USB 서보 상태 미확인 — 안전을 위해 NOT OP. "
+                               "GUI의 ARM 완료 확인이 필요합니다")
         with self.lock:
             self.home_feedback_status = home_status
             if len(valid_home_axes) == len(ACTIVE_AXES):
@@ -423,8 +545,34 @@ class GuardApp:
             ttk.Entry(controls, textvariable=variable, width=14).grid(row=1, column=col, padx=5, pady=5)
         ttk.Button(controls, text="소프트웨어 정지 요청", command=node.request_stop).grid(row=1, column=2, sticky="ew", padx=5, pady=5)
 
+        arm_row = ttk.LabelFrame(controls, text="PCM ARM / UNARM (USB)", padding=8)
+        arm_row.grid(row=2, column=0, columnspan=3, sticky="ew", padx=5,
+                     pady=(10, 2))
+        self.button1_button = tk.Button(
+            arm_row, text="ARM", command=self.press_arm,
+            bg="#d47a00", fg="white", activebackground="#f09a24",
+            activeforeground="white", font=("Sans", 11, "bold"),
+            padx=12, pady=7, state="disabled")
+        self.button1_button.pack(side="left")
+        self.unarm_button = tk.Button(
+            arm_row, text="HOME → UNARM", command=self.press_unarm,
+            bg="#8b1a1a", fg="white", activebackground="#b32626",
+            activeforeground="white", font=("Sans", 11, "bold"),
+            padx=12, pady=7, state="disabled")
+        self.unarm_button.pack(side="left", padx=(8, 0))
+        self.hard_off_button = tk.Button(
+            arm_row, text="즉시 OFF", command=self.press_servo_off_now,
+            bg="#4d1010", fg="white", activebackground="#7a1111",
+            activeforeground="white", font=("Sans", 10, "bold"),
+            padx=9, pady=7, state="disabled")
+        self.hard_off_button.pack(side="left", padx=(8, 0))
+        self.usb_status_label = ttk.Label(
+            arm_row, text="PCM USB CDC 포트 검색 중", wraplength=420)
+        self.usb_status_label.pack(side="left", padx=(12, 0), fill="x",
+                                   expand=True)
+
         motion_buttons = ttk.Frame(controls)
-        motion_buttons.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 2))
+        motion_buttons.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 2))
         self.motion_buttons = {}
         for col, (key, label) in enumerate((("grab", "GRAB"), ("box", "BOX"),
                                             ("tape", "TAPE"), ("home", "원점 복귀"))):
@@ -435,9 +583,9 @@ class GuardApp:
             motion_buttons.columnconfigure(col, weight=1)
             self.motion_buttons[key] = button
         self.catalog_label = ttk.Label(controls, text="PCM 모션 목록 대기 중")
-        self.catalog_label.grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=(4, 0))
+        self.catalog_label.grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=(4, 0))
         manual = ttk.Frame(controls)
-        manual.grid(row=4, column=0, columnspan=3, sticky="ew", padx=5, pady=(8, 0))
+        manual.grid(row=5, column=0, columnspan=3, sticky="ew", padx=5, pady=(8, 0))
         ttk.Label(manual, text="모션 ID 직접 실행").pack(side="left")
         ttk.Entry(manual, textvariable=self.manual_motion_id, width=7).pack(side="left", padx=6)
         ttk.Button(manual, text="ID 실행", command=self.play_manual_id).pack(side="left")
@@ -515,10 +663,56 @@ class GuardApp:
             return
         self.node.request_play(motion_id, threshold, hits)
 
+    def press_arm(self):
+        snapshot = self.node.snapshot()
+        armed = snapshot[4]
+        operation_mode = snapshot[13]
+        usb = snapshot[14]
+        if not usb.connected:
+            messagebox.showerror("PCM USB 미연결", usb.message)
+            return
+        if usb.servo_state == SERVO_ON or operation_mode == "OP":
+            messagebox.showinfo("이미 ARMED", "PCM 서보가 이미 ON 상태입니다.")
+            return
+        if armed:
+            messagebox.showerror(
+                "모션 실행 중",
+                "활성 모션을 먼저 정지한 뒤 ARM을 실행하세요.")
+            return
+        confirmed = messagebox.askyesno(
+            "PCM ARM 실행 확인",
+            "PCM 서보를 켭니다. 로봇이 설정된 부팅 자세로 약 3~5초간 실제로 "
+            "움직일 수 있습니다.\n\n로봇 주변을 비웠고 물리 E-Stop을 사용할 "
+            "준비가 되었습니까?",
+            icon="warning")
+        if confirmed:
+            self.node.request_arm()
+
+    def press_unarm(self):
+        usb = self.node.snapshot()[14]
+        if not usb.connected:
+            messagebox.showerror("PCM USB 미연결", usb.message)
+            return
+        confirmed = messagebox.askyesno(
+            "HOME → UNARM 확인",
+            "모션 1을 실행해 원점으로 복귀한 뒤, 성공 결과가 확인되면 서보를 "
+            "끕니다. 로봇이 실제로 움직입니다.\n\n로봇 주변을 비웠고 물리 "
+            "E-Stop을 사용할 준비가 되었습니까?",
+            icon="warning")
+        if confirmed:
+            self.node.request_unarm()
+
+    def press_servo_off_now(self):
+        usb = self.node.snapshot()[14]
+        if not usb.connected:
+            messagebox.showerror("PCM USB 미연결", usb.message)
+            return
+        self.node.request_servo_off_now()
+
     def refresh(self):
         (axes, last_frame, state, event, armed, hits, threshold,
          catalog, catalog_status, ready_status, peak_axis, peak_dob,
-         home_feedback_status, operation_mode) = self.node.snapshot()
+         home_feedback_status, operation_mode, usb) = self.node.snapshot()
         self.state_label.configure(text=f"{state} · 충격 감시 {'ON' if armed else 'OFF'}")
         self.event_label.configure(text=event)
         age = time.monotonic() - last_frame if last_frame else 999.0
@@ -535,6 +729,26 @@ class GuardApp:
         motor_text = "-" if peak_axis < 0 else f"{peak_axis}  (|DOB| {peak_dob:.3f} A)"
         self.motor_label.configure(text=f"감지 모터 ID(축 index): {motor_text}")
         self.catalog_label.configure(text=catalog_status)
+        build_text = (f" · build 0x{usb.build_id:08X}"
+                      if usb.build_id is not None else "")
+        port_text = f"{usb.port} · " if usb.port else ""
+        self.usb_status_label.configure(
+            text=f"{port_text}{usb.message}{build_text}")
+        button1_enabled = (
+            usb.connected and usb.phase not in ("ARMING", "UNARMING") and
+            operation_mode != "OP" and not armed)
+        self.button1_button.configure(
+            state="normal" if button1_enabled else "disabled",
+            text=("ARM 확인 중…" if usb.phase == "ARMING" else "ARM"))
+        self.unarm_button.configure(
+            state=("normal" if usb.connected and usb.phase != "UNARMING" and
+                   not armed
+                   else "disabled"),
+            text=("서보 OFF 확인 중…" if usb.phase == "UNARMING"
+                  else "HOME → UNARM"))
+        self.hard_off_button.configure(
+            state=("normal" if usb.connected and usb.phase != "UNARMING"
+                   else "disabled"))
         for key, button in self.motion_buttons.items():
             if key in catalog:
                 motion_id, name = catalog[key]
@@ -566,6 +780,7 @@ def main():
     try:
         root.mainloop()
     finally:
+        node.close()
         node.destroy_node()
         rclpy.shutdown()
         thread.join(timeout=1.0)

@@ -6,6 +6,7 @@ set -u
 NIC="${PHORCE_NIC:-eno1}"
 MODE="${PHORCE_MODE:-op_idle}"
 AXES="${PHORCE_AXES:-auto}"
+MOTION_DIR="${PHORCE_MOTION_DIR:-/media/phorce/9016-4EF8/Motions}"
 STARTUP_TIMEOUT="${PHORCE_STARTUP_TIMEOUT:-20}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
@@ -136,6 +137,12 @@ if ! command -v ros2 >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ ! -d "$MOTION_DIR" ]]; then
+  fail "모션 디렉터리를 찾을 수 없습니다: ${MOTION_DIR}"
+  fail "PCM SD카드가 마운트됐는지 확인하거나 PHORCE_MOTION_DIR를 지정하세요."
+  exit 1
+fi
+
 progress 2 "ROS 2 실행 파일 확인"
 for spec in \
   "agx_phorce_bridge phorce_monitor" \
@@ -192,7 +199,8 @@ else
 fi
 
 progress 6 "액션 서버 연결"
-ros2 run agx_motion_slot motion_action_server --ros-args -p backend:=ecat \
+ros2 run agx_motion_slot motion_action_server --ros-args \
+  -p backend:=ecat -p "motion_dir:=${MOTION_DIR}" \
   >"$ACTION_LOG" 2>&1 &
 ACTION_PID=$!
 

@@ -25,6 +25,12 @@ for command_name in terminator python3 ros2; do
   fi
 done
 
+PCM_PORT="${PHORCE_PCM_PORT:-/dev/ttyACM0}"
+if [[ -e "$PCM_PORT" && ( ! -r "$PCM_PORT" || ! -w "$PCM_PORT" ) ]]; then
+  printf '[WARN] PCM USB 포트 권한이 없습니다: %s\n' "$PCM_PORT" >&2
+  printf '[WARN] 현재 사용자를 dialout 그룹에 추가하고 다시 로그인해야 USB 1번 버튼 기능을 쓸 수 있습니다.\n' >&2
+fi
+
 printf '[INFO] 오른쪽: terminator three 레이아웃 시작\n'
 printf '[INFO] ROS_DOMAIN_ID=%s (GUI와 모든 통신 프로세스 공통)\n' "$ROS_DOMAIN_ID"
 terminator --no-dbus --config "$SCRIPT_DIR/terminator-three.conf" --layout three &
