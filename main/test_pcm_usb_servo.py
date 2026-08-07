@@ -104,6 +104,49 @@ class ProtocolTest(unittest.TestCase):
 
         self.assertFalse(client._studio_live)
 
+    def test_servo_on_releases_usb_owner_after_state_confirmation(self):
+        client = PcmUsbServoClient.__new__(PcmUsbServoClient)
+        client._stop = threading.Event()
+        client._unarm_requested = threading.Event()
+        client._release_port_until_command = False
+        client._port_release_not_before = 0.0
+        client._ensure_studio_live = Mock()
+        client._exchange = Mock(return_value=type(
+            "WriteAck", (), {"is_abort": False, "is_write_ack": True})())
+        client._read_servo_state = Mock(return_value=1)
+        client._publish = Mock()
+
+        client._perform_servo_on("/dev/ttyACM0")
+
+        self.assertTrue(client._release_port_until_command)
+        client._publish.assert_called_with(
+            connected=True, port="/dev/ttyACM0", phase="ON", servo_state=1,
+            message=("ARM 완료 — PCM 서보 ON 확인 · "
+                     "모션 소유권 반환을 위해 USB 세션 해제"))
+
+    def test_servo_off_releases_stale_cdc_after_state_confirmation(self):
+        client = PcmUsbServoClient.__new__(PcmUsbServoClient)
+        client._stop = threading.Event()
+        client._release_port_until_command = False
+        client._port_release_not_before = 0.0
+        client._prepare_servo_off_channel = Mock()
+        client._exchange_retry = Mock(return_value=type(
+            "WriteAck", (), {"is_abort": False, "is_write_ack": True})())
+        client._read_servo_state = Mock(return_value=0)
+        client._publish = Mock()
+
+        client._perform_servo_off("/dev/ttyACM0")
+
+        client._prepare_servo_off_channel.assert_called_once_with(
+            "/dev/ttyACM0")
+        self.assertTrue(client._release_port_until_command)
+        self.assertGreater(client._port_release_not_before, 0.0)
+        client._publish.assert_called_with(
+            connected=True, port="/dev/ttyACM0", phase="CONNECTED",
+            servo_state=0,
+            message=("UNARM 완료 — PCM 서보 OFF 확인 · "
+                     "다음 ARM 전까지 USB 포트 해제"))
+
 
 if __name__ == "__main__":
     unittest.main()

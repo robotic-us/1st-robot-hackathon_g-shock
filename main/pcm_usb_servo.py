@@ -315,6 +315,8 @@ class PcmUsbServoClient:
         self._sequence = 0
         self._session_generation = 0
         self._studio_live = False
+        self._release_port_until_command = False
+        self._port_release_not_before = 0.0
         self._rx = bytearray()
         self._thread = threading.Thread(
             target=self._run, name="PcmUsbServo", daemon=True)
@@ -375,7 +377,22 @@ class PcmUsbServoClient:
                     message=f"PCM USB 통신 오류: {exc}", servo_state=None)
             finally:
                 self._close_port()
-            self._stop.wait(1.0)
+            # ARM needs Studio LIVE only long enough to request and verify
+            # SERVO_ON. Keeping CDC/DTR open afterwards leaves PCM owned by
+            # Studio, so the EtherCAT motion window reports physical_idle=0
+            # and rejects every slot. Stay detached until the next explicit
+            # ARM/OFF command so the PCM watchdog can return motion ownership.
+            while (self._release_port_until_command and
+                   not self._stop.is_set() and
+                   (time.monotonic() < self._port_release_not_before or
+                    (not self._arm_requested.is_set() and
+                     not self._unarm_requested.is_set()))):
+                self._stop.wait(0.1)
+            if self._release_port_until_command:
+                self._release_port_until_command = False
+                self._port_release_not_before = 0.0
+            else:
+                self._stop.wait(1.0)
 
     def _open_port(self, port: str) -> None:
         fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
@@ -383,7 +400,8 @@ class PcmUsbServoClient:
             attrs = termios.tcgetattr(fd)
             attrs[0] = 0
             attrs[1] = 0
-            attrs[2] = termios.CLOCAL | termios.CREAD | termios.CS8
+            attrs[2] = (termios.CLOCAL | termios.CREAD | termios.CS8 |
+                        termios.HUPCL)
             attrs[3] = 0
             baud = getattr(termios, "B921600")
             attrs[4] = baud
@@ -408,6 +426,15 @@ class PcmUsbServoClient:
         self._studio_live = False
         if fd is not None:
             try:
+                # Do not rely on close(2) alone: older runs configured the tty
+                # without HUPCL, which can leave DTR asserted and make PCM
+                # believe Studio still owns the CDC session.
+                fcntl.ioctl(
+                    fd, getattr(termios, "TIOCMBIC", 0x5417),
+                    struct.pack("I", getattr(termios, "TIOCM_DTR", 0x002)))
+            except OSError:
+                pass
+            try:
                 os.close(fd)
             except OSError:
                 pass
@@ -427,6 +454,9 @@ class PcmUsbServoClient:
                     self._publish(
                         connected=True, port=port, phase="ERROR",
                         message=f"UNARM 실패: {exc}")
+                    self._release_port_until_command = True
+                if self._release_port_until_command:
+                    return
                 next_poll = time.monotonic() + 0.5
             elif self._arm_requested.is_set():
                 self._arm_requested.clear()
@@ -436,6 +466,12 @@ class PcmUsbServoClient:
                     self._publish(
                         connected=True, port=port, phase="ERROR",
                         message=f"ARM 실패: {exc}")
+                    # Never keep a descriptor that timed out during ARM. PCM
+                    # may have re-enumerated CDC without invalidating the old
+                    # fd, so the next request must start from a clean open.
+                    self._release_port_until_command = True
+                if self._release_port_until_command:
+                    return
                 next_poll = time.monotonic() + 2.0
             now = time.monotonic()
             if now >= next_poll:
@@ -495,9 +531,11 @@ class PcmUsbServoClient:
                 self._stop.wait(0.25)
                 continue
             if state == SERVO_ON:
+                self._release_port_until_command = True
                 self._publish(
                     connected=True, port=port, phase="ON", servo_state=state,
-                    message="ARM 완료 — PCM 서보 ON 확인")
+                    message=("ARM 완료 — PCM 서보 ON 확인 · "
+                             "모션 소유권 반환을 위해 USB 세션 해제"))
                 return
             if state in (SERVO_UNAVAILABLE, SERVO_UNCONFIGURED):
                 result = self._read_servo_result()
@@ -550,7 +588,8 @@ class PcmUsbServoClient:
             self._stop.wait(0.5)
             self._open_port(port)
         self._stop.wait(0.5)
-        hello_response = self._exchange_retry(
+        hello_response = self._exchange_retry_reopen(
+            port,
             OD_SESSION, SUB_SESSION_HELLO, timeout=1.5, attempts=5)
         if hello_response.is_abort:
             raise PcmUsbError(
@@ -687,6 +726,12 @@ class PcmUsbServoClient:
                     f"PCM SD 카드를 안전 해제하지 못했습니다: {detail}")
 
     def _perform_servo_off(self, port: str) -> None:
+        # OFF is a safety-direction command. Prime the CDC/SDO channel with
+        # HELLO, but do not acquire Studio LIVE: after a HOME motion the robot
+        # is still servo-on and PCM correctly refuses LIVE_BEGIN because its
+        # physical SAFE_PARKING flag is not set. Taking Studio ownership here
+        # would also close the EtherCAT motion window again.
+        self._prepare_servo_off_channel(port)
         self._publish(
             connected=True, port=port, phase="UNARMING",
             message="UNARM 전송 — PCM 서보 OFF 확인 중")
@@ -712,10 +757,18 @@ class PcmUsbServoClient:
                 self._stop.wait(0.1)
                 continue
             if state == SERVO_OFF:
+                # OFF returns PCM to storage/parking mode. The existing CDC
+                # descriptor can remain visible while its fd stops answering,
+                # so force the next ARM to begin with a fresh open/session.
+                self._release_port_until_command = True
+                # Give PCM time to finish switching back to storage/parking
+                # before a queued next ARM is allowed to reopen CDC.
+                self._port_release_not_before = time.monotonic() + 3.0
                 self._publish(
                     connected=True, port=port, phase="CONNECTED",
                     servo_state=state,
-                    message="UNARM 완료 — PCM 서보 OFF 확인 (토크 해제)")
+                    message=("UNARM 완료 — PCM 서보 OFF 확인 · "
+                             "다음 ARM 전까지 USB 포트 해제"))
                 return
             self._publish(
                 connected=True, port=port, phase="UNARMING",
@@ -723,6 +776,27 @@ class PcmUsbServoClient:
                 message="UNARM 처리 중 — PCM 서보 OFF 대기")
             self._stop.wait(0.1)
         raise PcmUsbError("서보 OFF가 5초 안에 확인되지 않았습니다")
+
+    def _prepare_servo_off_channel(self, port: str) -> None:
+        self._publish(
+            connected=True, port=port, phase="UNARMING",
+            message="PCM OFF 채널 준비 — USB HELLO 확인 중")
+        mounted_devices = self._pcm_mounted_block_devices(port)
+        if mounted_devices:
+            self._close_port()
+            self._unmount_block_devices(mounted_devices)
+            self._stop.wait(0.5)
+            self._open_port(port)
+        self._stop.wait(0.5)
+        hello_response = self._exchange_retry_reopen(
+            port, OD_SESSION, SUB_SESSION_HELLO,
+            timeout=1.5, attempts=5)
+        if hello_response.is_abort:
+            raise PcmUsbError(
+                f"PCM HELLO 거부 0x{hello_response.abort_code:08X}")
+        hello = parse_session_hello(hello_response.data)
+        if not hello.capability_bits & SESSION_CAP_STORAGE:
+            raise PcmUsbError("PCM이 USB 서보 제어 채널을 지원하지 않습니다")
 
     def _publish_servo_state(self, port: str, state: int) -> None:
         old = self.snapshot()
@@ -791,6 +865,45 @@ class PcmUsbServoClient:
                     self._stop.wait(0.5)
         assert last_error is not None
         raise last_error
+
+    def _exchange_retry_reopen(self, port: str, index: int, subindex: int,
+                               data: Optional[bytes] = None,
+                               timeout: float = 0.8,
+                               attempts: int = 3) -> SdoResponse:
+        """Retry a session exchange with a fresh CDC fd each time.
+
+        PCM mode transitions can leave an open tty fd selectable/writable but
+        permanently silent. Retrying frames on that fd cannot recover it.
+        """
+        if attempts < 1:
+            raise ValueError("attempts must be at least one")
+        last_error: Optional[BaseException] = None
+        for attempt in range(attempts):
+            if self._fd is None:
+                try:
+                    self._open_port(port)
+                except OSError as open_exc:
+                    last_error = open_exc
+                    if attempt + 1 < attempts:
+                        self._stop.wait(0.5)
+                    continue
+            try:
+                return self._exchange(index, subindex, data, timeout)
+            except (OSError, PcmUsbError) as exc:
+                if isinstance(exc, PcmUsbError) and "응답 timeout" not in str(exc):
+                    raise
+                last_error = exc
+                if attempt + 1 < attempts:
+                    self._close_port()
+                    self._stop.wait(0.5)
+                    try:
+                        self._open_port(port)
+                    except OSError as open_exc:
+                        last_error = open_exc
+                        self._stop.wait(0.5)
+        raise PcmUsbError(
+            f"CDC 재연결 후에도 SDO 0x{index:04X}:{subindex:02X} 응답 timeout: "
+            f"{last_error}")
 
     def _write_all(self, data: bytes) -> None:
         if self._fd is None:

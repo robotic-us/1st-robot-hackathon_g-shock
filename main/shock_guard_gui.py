@@ -31,12 +31,12 @@ from pcm_usb_servo import (
 ACTION = "/motion_action_server/play_motion_sequence"
 FEEDBACK = "/phorce/feedback"
 CATALOG_SERVICE = "/motion_action_server/list_motion_slots"
-MOTION_ALIASES = {
-    "grab": ("GRAB",),
-    "box": ("BOX", "BOX_TEST"),
-    "tape": ("TAPE",),
-    "home": ("HOME", "RETURN_HOME", "GO_HOME"),
+MOTION_SLOT_IDS = {
+    "home": 1,
+    "box": 3,
+    "grab": 4,
 }
+ALLOWED_MOTION_IDS = frozenset(MOTION_SLOT_IDS.values())
 PARK_MOTION_ID = 1
 # /phorce/feedback.position_rad reference poses from operator captures.
 # HOME_ZERO_RAD is the unprepared home-zero pose; BUTTON1_READY_RAD is the pose
@@ -176,10 +176,6 @@ class GuardNode(Node):
         with self.lock:
             self.motion_ready_status = status
 
-    @staticmethod
-    def _normalized_name(name):
-        return "_".join(name.strip().upper().replace("-", "_").split())
-
     def _refresh_catalog(self):
         if self.catalog_request is not None or not self.catalog_client.service_is_ready():
             return
@@ -196,17 +192,15 @@ class GuardNode(Node):
             return
         mapped = {}
         if response.library_loaded:
-            normalized = [(slot.id, slot.name, self._normalized_name(slot.name))
-                          for slot in response.slots]
-            for key, aliases in MOTION_ALIASES.items():
-                matches = [(slot_id, name) for slot_id, name, norm in normalized
-                           if norm in aliases]
-                if len(matches) == 1:
-                    mapped[key] = matches[0]
+            slots_by_id = {slot.id: slot.name for slot in response.slots}
+            for key, slot_id in MOTION_SLOT_IDS.items():
+                if slot_id in slots_by_id:
+                    mapped[key] = (slot_id, slots_by_id[slot_id])
         with self.lock:
             self.motion_catalog = mapped
             found = ", ".join(f"{key}={value[0]}" for key, value in mapped.items())
-            self.catalog_status = f"카탈로그 매핑: {found}" if found else "grab/box/tape/HOME 이름과 일치하는 슬롯 없음"
+            self.catalog_status = (f"허용 슬롯: {found}" if found else
+                                   "허용 슬롯 1(HOME), 3(BOX), 4(GRAB) 없음")
 
     def _set_status(self, state=None, event=None):
         with self.lock:
@@ -494,13 +488,8 @@ class GuardNode(Node):
             self.home_feedback_status = home_status
             if len(valid_home_axes) == len(ACTIVE_AXES):
                 self.operation_mode = operation_mode
-        if not self.armed or self.cancel_pending:
-            self.hits = 0
-            return
         if peak >= self.threshold:
-            self.hits += 1
-            if self.hits >= self.required_hits:
-                self._cancel(f"충격 감지: 축 {peak_axis}, |DOB|={peak:.2f} A")
+            self.hits = min(self.hits + 1, self.required_hits)
         else:
             self.hits = 0
 
@@ -528,11 +517,17 @@ class GuardApp:
         header_text = ttk.Frame(header)
         header_text.pack(side="left", fill="x", expand=True)
         ttk.Label(header_text, text="외부 충격 모션 가드", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(header_text, text="DOB 외란 추정값을 감시해 활성 모션에 취소 요청을 보냅니다.").pack(anchor="w", pady=(2, 14))
+        ttk.Label(header_text, text="DOB 외란 추정값을 크게 표시합니다. 모션 제어 명령은 보내지 않습니다.").pack(anchor="w", pady=(2, 14))
         self.mode_badge = tk.Label(header, text="NOT OP", bg="#8b1a1a", fg="white",
                                    font=("Sans", 13, "bold"), width=15,
                                    relief="solid", borderwidth=2, padx=10, pady=8)
         self.mode_badge.pack(side="right", anchor="ne", padx=(12, 0))
+
+        self.dob_alert_label = tk.Label(
+            frame, text="DOB 상태 확인 중", bg="#555555", fg="white",
+            font=("Sans", 22, "bold"), relief="solid", borderwidth=3,
+            padx=14, pady=14)
+        self.dob_alert_label.pack(fill="x", pady=(0, 12))
 
         controls = ttk.LabelFrame(frame, text="실행 설정", padding=12)
         controls.pack(fill="x")
@@ -543,7 +538,8 @@ class GuardApp:
                                                   ("연속 프레임", self.hits))):
             ttk.Label(controls, text=label).grid(row=0, column=col, sticky="w", padx=5)
             ttk.Entry(controls, textvariable=variable, width=14).grid(row=1, column=col, padx=5, pady=5)
-        ttk.Button(controls, text="소프트웨어 정지 요청", command=node.request_stop).grid(row=1, column=2, sticky="ew", padx=5, pady=5)
+        ttk.Label(controls, text="DOB는 표시 전용 · 자동 정지 없음").grid(
+            row=1, column=2, sticky="ew", padx=5, pady=5)
 
         arm_row = ttk.LabelFrame(controls, text="PCM ARM / UNARM (USB)", padding=8)
         arm_row.grid(row=2, column=0, columnspan=3, sticky="ew", padx=5,
@@ -574,8 +570,9 @@ class GuardApp:
         motion_buttons = ttk.Frame(controls)
         motion_buttons.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 2))
         self.motion_buttons = {}
-        for col, (key, label) in enumerate((("grab", "GRAB"), ("box", "BOX"),
-                                            ("tape", "TAPE"), ("home", "원점 복귀"))):
+        for col, (key, label) in enumerate((("home", "원점 복귀"),
+                                            ("box", "BOX"),
+                                            ("grab", "GRAB"))):
             button = ttk.Button(motion_buttons, text=label,
                                 command=lambda selected=key: self.play_motion(selected),
                                 state="disabled")
@@ -625,9 +622,10 @@ class GuardApp:
         tk.Button(shutdown_row, text="전체 종료",
                   command=self.close, bg="#343434", fg="white",
                   activebackground="#555555", activeforeground="white",
-                  font=("Sans", 9, "bold"), padx=8, pady=3).pack(side="right")
+                  font=("Sans", 13, "bold"), padx=22, pady=18,
+                  width=12).pack(side="right")
 
-        warning = tk.Label(frame, text="주의: 액션 cancel은 E-Stop이 아닙니다. 위험 시 반드시 물리 E-Stop을 사용하세요.",
+        warning = tk.Label(frame, text="DOB 경고는 표시 전용입니다. 위험 시 반드시 물리 E-Stop을 사용하세요.",
                            bg="#7a1111", fg="white", font=("Sans", 11, "bold"), padx=10, pady=9)
         warning.pack(fill="x", pady=(12, 0))
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -654,12 +652,13 @@ class GuardApp:
             motion_id = int(self.manual_motion_id.get())
             threshold = float(self.threshold.get())
             hits = int(self.hits.get())
-            if not 1 <= motion_id <= 50 or threshold <= 0 or hits < 1:
+            if motion_id not in ALLOWED_MOTION_IDS or threshold <= 0 or hits < 1:
                 raise ValueError
         except ValueError:
             messagebox.showerror(
                 "입력 오류",
-                "모션 ID 1~50, 양수 임계값, 연속 프레임 1 이상을 입력하세요.")
+                "허용 모션 ID는 1(HOME), 3(BOX), 4(GRAB)입니다. "
+                "양수 임계값과 연속 프레임 1 이상을 입력하세요.")
             return
         self.node.request_play(motion_id, threshold, hits)
 
@@ -717,6 +716,18 @@ class GuardApp:
         self.event_label.configure(text=event)
         age = time.monotonic() - last_frame if last_frame else 999.0
         self.fresh_label.configure(text=f"피드백: {'정상' if age < 0.2 else '끊김'} · 임계 연속 {hits}회")
+        dob_alert = hits >= max(1, self.node.required_hits)
+        if age >= 0.2:
+            dob_text = "DOB 피드백 끊김"
+            dob_bg = "#555555"
+        elif dob_alert:
+            axis_text = "-" if peak_axis < 0 else str(peak_axis)
+            dob_text = f"DOB 주의  |  축 {axis_text}  |  {peak_dob:.2f} A"
+            dob_bg = "#b3261e"
+        else:
+            dob_text = f"DOB 정상  |  최대 {peak_dob:.2f} A"
+            dob_bg = "#19713a"
+        self.dob_alert_label.configure(text=dob_text, bg=dob_bg)
         self.ready_label.configure(text=f"PCM 모션 준비: {ready_status}")
         self.button_input_label.configure(text=f"운영 절차 추정: {home_feedback_status}")
         badge_colors = {
@@ -766,8 +777,7 @@ class GuardApp:
         self.root.after(100, self.refresh)
 
     def close(self):
-        self.node.request_stop()
-        self.root.after(150, self.root.destroy)
+        self.root.destroy()
 
 
 def main():

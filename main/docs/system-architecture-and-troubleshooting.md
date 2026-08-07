@@ -4,7 +4,7 @@
 
 이 시스템은 실물 PHORCE 로봇에서 다음 기능을 하나의 운영 GUI로 통합한다.
 
-- EtherCAT 기반 실시간 상태 수집과 DOB 충격 감시
+- EtherCAT 기반 실시간 상태 수집과 표시 전용 DOB 충격 경고
 - PCM SD카드에 적재된 모션 슬롯 조회 및 ROS 2 Action 실행
 - PCM USB-CDC를 통한 ARM(서보 ON)과 즉시 OFF
 - HOME 모션 성공을 확인한 뒤에만 토크를 해제하는 `HOME → UNARM`
@@ -74,11 +74,12 @@ PCM SD카드의 `Motions` 디렉터리에는 슬롯 1, 2, 3, 4, 5, 48, 49, 50이
 | 슬롯 | MS Name | GUI 용도 |
 |---:|---|---|
 | 1 | `home` | HOME 및 HOME → UNARM |
-| 2 | `grab` | GRAB |
 | 3 | `box` | BOX |
+| 4 | 기체 저장 이름 사용 | GRAB |
 | 5 | `BUTTON1_READY` | 준비 자세 |
-| 49 | `grab_test` | 시험 모션 |
-| 50 | `IK` | IK 시험 |
+
+운영 GUI는 슬롯 1, 3, 4만 허용한다. 이름은 표시용으로만 사용하며 실행 매핑은 ID로
+고정한다.
 
 CSV의 SHA-256과 `.memo.json`의 `motion_sha256`은 전 슬롯에서 일치했다. 즉, 당시
 모션 실행 실패는 SD 파일 손상이 아니었다.
@@ -94,14 +95,24 @@ ARM은 phorce Studio에서 관찰한 순서를 따른다.
 5. `LIVE_BEGIN` 전송 및 Studio LIVE 상태 확인
 6. `0x5F08:01=1`로 서보 ON 요청
 7. `0x5F08:02`를 폴링하여 실제 `SERVO_ON` 확인
+8. CDC/DTR을 닫아 Studio LIVE 소유권을 PCM 모션 창구에 반환
 
 Write ACK만으로 ARM 성공을 판정하지 않는다. 실제 상태가 12초 안에 ON으로 확인되지
-않으면 실패로 처리한다.
+않으면 실패로 처리한다. ON 확인 뒤 USB 연결을 계속 유지하면 PCM이
+`OWNED_BY_STUDIO` 상태로 남아 EtherCAT 슬롯을 거절하므로, 다음 명령 전까지 포트를
+닫아 둔다.
 
 `HOME → UNARM`은 슬롯 1 Action 결과가 성공(`status=0`)일 때만
-`0x5F08:01=0`을 전송한다. HOME이 거절·중단·취소되면 로봇이 임의 자세에서 무너지는
+USB HELLO로 SDO 채널을 준비하고 `0x5F08:01=0`을 전송한다. ARM 직후 LIVE는
+EtherCAT 모션 실행을 위해 해제한다. HOME 완료 뒤에도 서보는 ON이므로 PCM의 물리
+`SAFE_PARKING` 비트는 false일 수 있고, 이때 LIVE_BEGIN을 요구하면 순환적으로
+UNARM이 불가능해진다. 따라서 안전 방향 OFF는 Studio 소유권 없이 전송한다.
+HOME이 거절·중단·취소되면 로봇이 임의 자세에서 무너지는
 것을 막기 위해 토크를 유지한다. 별도의 `즉시 OFF`는 홈 복귀 없이 토크를 제거하는
-안전 방향의 수동 수단이다.
+안전 방향의 수동 수단이다. OFF 상태 확인 뒤에도 CDC를 닫는다. PCM이 스토리지/파킹
+모드로 돌아가는 동안 기존 tty fd가 남아 있으면서 응답만 멈출 수 있기 때문에, 다음
+ARM은 반드시 새 fd와 새 LIVE 협상으로 시작한다. 포트를 닫기 전 DTR을 명시적으로
+내리고 tty에 HUPCL을 설정해 PCM이 CDC 호스트 해제를 확실히 감지하게 한다.
 
 ## 6. 발생 문제와 해결 과정
 
