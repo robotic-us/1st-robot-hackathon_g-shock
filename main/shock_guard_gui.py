@@ -26,6 +26,7 @@ from pcm_usb_servo import (
     SERVO_ON,
     SERVO_TRANSITION,
 )
+from voice_command import VoiceCommandRecognizer
 
 
 ACTION = "/motion_action_server/play_motion_sequence"
@@ -65,6 +66,8 @@ BUTTON1_MOVE_VELOCITY_RAD_S = 0.05
 BUTTON1_SETTLE_VELOCITY_RAD_S = 0.03
 BACK_HOME_TOLERANCE_RAD = 0.05
 BACK_HOME_SAMPLES = 200
+DOB_AUTO_OFF_A = 3.0
+DOB_AUTO_OFF_RESET_A = 2.5
 
 
 def circular_difference_rad(position_rad, reference_rad):
@@ -109,6 +112,7 @@ class GuardNode(Node):
         self.motion_ready_seen = False
         self.peak_axis = -1
         self.peak_dob = 0.0
+        self.dob_auto_off_latched = False
         self.home_ready_samples = 0
         self.home_feedback_status = "피드백 대기 중"
         self.operation_mode = "NOT OP"
@@ -359,6 +363,18 @@ class GuardNode(Node):
             self.last_frame = now
             self.peak_axis = peak_axis
             self.peak_dob = peak
+        auto_off = False
+        if peak > DOB_AUTO_OFF_A and not self.dob_auto_off_latched:
+            self.dob_auto_off_latched = True
+            auto_off = True
+        elif peak < DOB_AUTO_OFF_RESET_A:
+            self.dob_auto_off_latched = False
+        if auto_off:
+            self.request_servo_off_now()
+            self._set_status(
+                state="DOB 자동 즉시 OFF 중",
+                event=(f"축 {peak_axis} |DOB| {peak:.3f} A > "
+                       f"{DOB_AUTO_OFF_A:.1f} A — USB 서보 OFF 요청"))
         valid_home_axes = [message.axis[i] for i in ACTIVE_AXES
                            if message.axis[i].valid]
         if len(valid_home_axes) != len(ACTIVE_AXES):
@@ -498,6 +514,13 @@ class GuardApp:
     def __init__(self, root, node):
         self.root = root
         self.node = node
+        self.voice = VoiceCommandRecognizer()
+        self.voice_results = queue.SimpleQueue()
+        self.voice_busy = False
+        self.voice_ready = False
+        self.voice_stop_event = None
+        self.voice_release_after_id = None
+        self.pending_voice_command = None
         root.title("G-SHOCK Motion Guard")
         # Window decorations extend beyond the Tk client area. Keep a small gap
         # at the center so the GUI border never covers the right-hand terminal.
@@ -517,11 +540,27 @@ class GuardApp:
         header_text = ttk.Frame(header)
         header_text.pack(side="left", fill="x", expand=True)
         ttk.Label(header_text, text="외부 충격 모션 가드", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(header_text, text="DOB 외란 추정값을 크게 표시합니다. 모션 제어 명령은 보내지 않습니다.").pack(anchor="w", pady=(2, 14))
+        ttk.Label(
+            header_text,
+            text="DOB 외란 추정값 표시 · |DOB| 3.0A 초과 시 USB 즉시 OFF"
+        ).pack(anchor="w", pady=(2, 14))
         self.mode_badge = tk.Label(header, text="NOT OP", bg="#8b1a1a", fg="white",
                                    font=("Sans", 13, "bold"), width=15,
                                    relief="solid", borderwidth=2, padx=10, pady=8)
         self.mode_badge.pack(side="right", anchor="ne", padx=(12, 0))
+        self.emergency_stop_button = tk.Button(
+            header, text="긴급 정지", command=self.press_servo_off_now,
+            bg="#b00020", fg="white", activebackground="#e00028",
+            activeforeground="white", font=("Sans", 15, "bold"),
+            padx=20, pady=14, width=9, state="disabled")
+        self.emergency_stop_button.pack(
+            side="right", anchor="ne", padx=(12, 0))
+        tk.Button(
+            header, text="전체 종료", command=self.close,
+            bg="#343434", fg="white", activebackground="#555555",
+            activeforeground="white", font=("Sans", 13, "bold"),
+            padx=18, pady=14, width=10).pack(
+                side="right", anchor="ne", padx=(12, 0))
 
         self.dob_alert_label = tk.Label(
             frame, text="DOB 상태 확인 중", bg="#555555", fg="white",
@@ -538,7 +577,7 @@ class GuardApp:
                                                   ("연속 프레임", self.hits))):
             ttk.Label(controls, text=label).grid(row=0, column=col, sticky="w", padx=5)
             ttk.Entry(controls, textvariable=variable, width=14).grid(row=1, column=col, padx=5, pady=5)
-        ttk.Label(controls, text="DOB는 표시 전용 · 자동 정지 없음").grid(
+        ttk.Label(controls, text="|DOB| > 3.0A · USB 자동 즉시 OFF").grid(
             row=1, column=2, sticky="ew", padx=5, pady=5)
 
         arm_row = ttk.LabelFrame(controls, text="PCM ARM / UNARM (USB)", padding=8)
@@ -556,12 +595,6 @@ class GuardApp:
             activeforeground="white", font=("Sans", 11, "bold"),
             padx=12, pady=7, state="disabled")
         self.unarm_button.pack(side="left", padx=(8, 0))
-        self.hard_off_button = tk.Button(
-            arm_row, text="즉시 OFF", command=self.press_servo_off_now,
-            bg="#4d1010", fg="white", activebackground="#7a1111",
-            activeforeground="white", font=("Sans", 10, "bold"),
-            padx=9, pady=7, state="disabled")
-        self.hard_off_button.pack(side="left", padx=(8, 0))
         self.usb_status_label = ttk.Label(
             arm_row, text="PCM USB CDC 포트 검색 중", wraplength=420)
         self.usb_status_label.pack(side="left", padx=(12, 0), fill="x",
@@ -586,6 +619,41 @@ class GuardApp:
         ttk.Label(manual, text="모션 ID 직접 실행").pack(side="left")
         ttk.Entry(manual, textvariable=self.manual_motion_id, width=7).pack(side="left", padx=6)
         ttk.Button(manual, text="ID 실행", command=self.play_manual_id).pack(side="left")
+
+        voice_row = ttk.LabelFrame(
+            controls, text="실험 기능 · 한국어 음성 명령", padding=8)
+        voice_row.grid(row=6, column=0, columnspan=3, sticky="ew", padx=5,
+                       pady=(10, 2))
+        self.voice_button = tk.Button(
+            voice_row, text="음성 모델 준비 중…",
+            bg="#28518a", fg="white", activebackground="#3b6cae",
+            activeforeground="white", font=("Sans", 12, "bold"),
+            padx=14, pady=9, state="disabled")
+        self.voice_button.pack(side="left")
+        self.voice_button.bind("<ButtonPress-1>", self.start_voice)
+        self.voice_button.bind("<ButtonRelease-1>", self.stop_voice)
+        voice_result = ttk.Frame(voice_row)
+        voice_result.pack(side="left", fill="x", expand=True, padx=(10, 0))
+        self.voice_raw_label = tk.Label(
+            voice_result, text="인식 원문: -", bg="#e8edf5",
+            fg="#17202a", font=("Sans", 11), anchor="w", padx=10, pady=5)
+        self.voice_raw_label.pack(fill="x")
+        self.voice_command_label = tk.Label(
+            voice_result, text="후처리 명령: -", bg="#e8edf5",
+            fg="#17202a", font=("Sans", 12, "bold"), anchor="w",
+            padx=10, pady=5)
+        self.voice_command_label.pack(fill="x", pady=(2, 0))
+        self.voice_execute_button = tk.Button(
+            voice_row, text="인식 결과 실행", command=self.execute_voice,
+            bg="#d47a00", fg="white", activebackground="#f09a24",
+            activeforeground="white", font=("Sans", 12, "bold"),
+            padx=14, pady=9, state="disabled")
+        self.voice_execute_button.pack(side="left", padx=(10, 0))
+        ttk.Label(
+            voice_row,
+            text=("준비→ARM · 물건→GRAB · 포장→BOX · "
+                  "종료→HOME/UNARM · Enter로 실행")
+        ).pack(side="bottom", anchor="w", padx=(10, 0), pady=(5, 0))
 
         status = ttk.LabelFrame(frame, text="상태", padding=12)
         status.pack(fill="x", pady=12)
@@ -617,18 +685,15 @@ class GuardApp:
         for i in range(12):
             self.tree.insert("", "end", iid=str(i), values=("-", "-", "-", "-", ""))
 
-        shutdown_row = ttk.Frame(frame)
-        shutdown_row.pack(fill="x", pady=(8, 0))
-        tk.Button(shutdown_row, text="전체 종료",
-                  command=self.close, bg="#343434", fg="white",
-                  activebackground="#555555", activeforeground="white",
-                  font=("Sans", 13, "bold"), padx=22, pady=18,
-                  width=12).pack(side="right")
-
-        warning = tk.Label(frame, text="DOB 경고는 표시 전용입니다. 위험 시 반드시 물리 E-Stop을 사용하세요.",
+        warning = tk.Label(frame, text="DOB 3.0A 초과 시 USB 즉시 OFF를 요청합니다. 위험 시 반드시 물리 E-Stop을 사용하세요.",
                            bg="#7a1111", fg="white", font=("Sans", 11, "bold"), padx=10, pady=9)
         warning.pack(fill="x", pady=(12, 0))
         root.protocol("WM_DELETE_WINDOW", self.close)
+        root.bind_all("<KeyPress-space>", self.start_voice)
+        root.bind_all("<KeyRelease-space>", self.stop_voice)
+        root.bind_all("<Return>", self.execute_voice)
+        threading.Thread(target=self._prepare_voice,
+                         name="VoiceModelLoader", daemon=True).start()
         root.after(100, self.refresh)
 
     def play_motion(self, motion_key):
@@ -646,6 +711,76 @@ class GuardApp:
             return
         motion_id, _name = catalog[motion_key]
         self.node.request_play(motion_id, threshold, hits)
+
+    def _prepare_voice(self):
+        try:
+            self.voice.warm_up()
+            self.voice_results.put(("ready", None))
+        except Exception as exc:
+            self.voice_results.put(("error", str(exc)))
+
+    def start_voice(self, _event=None):
+        # X11 key repeat can emit synthetic KeyRelease/KeyPress pairs while
+        # space is still held. Cancel a pending release before checking busy.
+        if self.voice_release_after_id is not None:
+            try:
+                self.root.after_cancel(self.voice_release_after_id)
+            except tk.TclError:
+                pass
+            self.voice_release_after_id = None
+        if self.voice_busy or not self.voice_ready:
+            return "break"
+        self.voice_busy = True
+        self.voice_stop_event = threading.Event()
+        self.pending_voice_command = None
+        self.voice_execute_button.configure(
+            state="disabled", text="인식 결과 실행")
+        self.voice_button.configure(text="듣는 중… 스페이스를 떼세요")
+        self.voice_raw_label.configure(
+            text="인식 원문: 듣는 중…", bg="#fff0b3")
+        self.voice_command_label.configure(
+            text="후처리 명령: 대기", bg="#fff0b3")
+        threading.Thread(target=self._recognize_voice,
+                         name="VoiceCommand", daemon=True).start()
+        return "break"
+
+    def stop_voice(self, _event=None):
+        if self.voice_busy and self.voice_release_after_id is None:
+            # A real release is not followed by another KeyPress. Auto-repeat
+            # is, so give that press a short window to cancel this callback.
+            self.voice_release_after_id = self.root.after(
+                120, self._finish_voice_release)
+        return "break"
+
+    def _finish_voice_release(self):
+        self.voice_release_after_id = None
+        if self.voice_busy and self.voice_stop_event is not None:
+            self.voice_stop_event.set()
+            self.voice_button.configure(text="인식 중…")
+
+    def _recognize_voice(self):
+        try:
+            result = self.voice.recognize_until(self.voice_stop_event)
+            self.voice_results.put(("result", result))
+        except Exception as exc:
+            self.voice_results.put(("error", str(exc)))
+
+    def execute_voice(self, _event=None):
+        command = self.pending_voice_command
+        if not command:
+            return None
+        self.pending_voice_command = None
+        self.voice_execute_button.configure(
+            state="disabled", text="인식 결과 실행")
+        if command == "준비":
+            self.press_arm()
+        elif command == "물건 넣어줘":
+            self.play_motion("grab")
+        elif command == "포장해줘":
+            self.play_motion("box")
+        elif command == "종료":
+            self.press_unarm()
+        return "break"
 
     def play_manual_id(self):
         try:
@@ -709,6 +844,56 @@ class GuardApp:
         self.node.request_servo_off_now()
 
     def refresh(self):
+        try:
+            voice_kind, voice_value = self.voice_results.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            if voice_kind == "ready":
+                self.voice_ready = True
+                self.voice_button.configure(
+                    state="normal", text="스페이스 누르고 말하기")
+                self.voice_raw_label.configure(
+                    text="인식 원문: 준비 완료", bg="#e8edf5")
+                self.voice_command_label.configure(
+                    text="후처리 명령: 스페이스를 누르는 동안 말하세요",
+                    bg="#e8edf5")
+            elif voice_kind in ("result", "error"):
+                self.voice_busy = False
+                self.voice_stop_event = None
+                self.voice_button.configure(
+                    state=("normal" if self.voice_ready else "disabled"),
+                    text="스페이스 누르고 말하기")
+            if voice_kind == "error":
+                self.pending_voice_command = None
+                self.voice_raw_label.configure(
+                    text=f"인식 원문: 오류 · {voice_value}", bg="#ffd6d6")
+                self.voice_command_label.configure(
+                    text="후처리 명령: -", bg="#ffd6d6")
+            elif voice_kind == "result" and voice_value.command:
+                self.pending_voice_command = voice_value.command
+                self.voice_raw_label.configure(
+                    text=(f"인식 원문: {voice_value.transcript or '-'} · "
+                          f"{voice_value.captured_seconds:.2f}초 · "
+                          f"피크 RMS {voice_value.peak_rms}"),
+                    bg="#dbeafe")
+                self.voice_command_label.configure(
+                    text=(f"후처리 명령: {voice_value.command} · "
+                          "Enter 또는 실행 버튼"), bg="#ccebd7")
+                self.voice_execute_button.configure(
+                    state="normal",
+                    text=f"실행: {voice_value.command}")
+            elif voice_kind == "result":
+                self.pending_voice_command = None
+                heard = voice_value.transcript or "-"
+                self.voice_raw_label.configure(
+                    text=(f"인식 원문: {heard} · "
+                          f"{voice_value.captured_seconds:.2f}초 · "
+                          f"피크 RMS {voice_value.peak_rms}"),
+                    bg="#ffd6d6")
+                self.voice_command_label.configure(
+                    text=f"후처리 명령: 없음 · {voice_value.detail}",
+                    bg="#ffd6d6")
         (axes, last_frame, state, event, armed, hits, threshold,
          catalog, catalog_status, ready_status, peak_axis, peak_dob,
          home_feedback_status, operation_mode, usb) = self.node.snapshot()
@@ -716,13 +901,14 @@ class GuardApp:
         self.event_label.configure(text=event)
         age = time.monotonic() - last_frame if last_frame else 999.0
         self.fresh_label.configure(text=f"피드백: {'정상' if age < 0.2 else '끊김'} · 임계 연속 {hits}회")
-        dob_alert = hits >= max(1, self.node.required_hits)
+        dob_alert = peak_dob > DOB_AUTO_OFF_A
         if age >= 0.2:
             dob_text = "DOB 피드백 끊김"
             dob_bg = "#555555"
         elif dob_alert:
             axis_text = "-" if peak_axis < 0 else str(peak_axis)
-            dob_text = f"DOB 주의  |  축 {axis_text}  |  {peak_dob:.2f} A"
+            dob_text = (f"DOB 자동 OFF  |  축 {axis_text}  |  "
+                        f"{peak_dob:.2f} A > {DOB_AUTO_OFF_A:.1f} A")
             dob_bg = "#b3261e"
         else:
             dob_text = f"DOB 정상  |  최대 {peak_dob:.2f} A"
@@ -757,7 +943,7 @@ class GuardApp:
                    else "disabled"),
             text=("서보 OFF 확인 중…" if usb.phase == "UNARMING"
                   else "HOME → UNARM"))
-        self.hard_off_button.configure(
+        self.emergency_stop_button.configure(
             state=("normal" if usb.connected and usb.phase != "UNARMING"
                    else "disabled"))
         for key, button in self.motion_buttons.items():
@@ -777,6 +963,12 @@ class GuardApp:
         self.root.after(100, self.refresh)
 
     def close(self):
+        if self.voice_release_after_id is not None:
+            try:
+                self.root.after_cancel(self.voice_release_after_id)
+            except tk.TclError:
+                pass
+        self.voice.close()
         self.root.destroy()
 
 

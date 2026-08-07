@@ -787,7 +787,10 @@ class PcmUsbServoClient:
             self._unmount_block_devices(mounted_devices)
             self._stop.wait(0.5)
             self._open_port(port)
-        self._stop.wait(0.5)
+        else:
+            # No storage transition or CDC reopen occurred. Avoid adding the
+            # former fixed 0.5 s delay to every DOB/emergency OFF request.
+            self._stop.wait(0.05)
         hello_response = self._exchange_retry_reopen(
             port, OD_SESSION, SUB_SESSION_HELLO,
             timeout=1.5, attempts=5)
