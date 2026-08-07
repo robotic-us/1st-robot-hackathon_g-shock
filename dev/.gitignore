@@ -1,2 +1,6 @@
 logs/*.log
 logs/*.pid
+features/grab_planner/out/
+features/grab_planner/slot_grid.json
+features/grab_planner/calibration.json
+features/grab_planner/__pycache__/

@@ -61,10 +61,42 @@ phorce status --target sim:dev
 sim 은 `/sim/<세션>` namespace 로 뜨므로 실기(root namespace)와 **같은 domain 을 써도
 충돌하지 않습니다**. 실기 스택을 띄운 채로 sim 을 병행해도 됩니다.
 
+## grab_planner — 비전 좌표로 양팔 grab 모션 만들기
+
+`dev/features/grab_planner/` 에 있습니다. 비전이 준 물체 위치를 받아 양팔 핀치
+모션을 만들어 PCM 슬롯 파일(`motion_NN.csv` + memo)로 떨굽니다.
+
+```bash
+cd dev/features/grab_planner
+./plan_grab.py reach                                   # 집을 수 있는 영역
+./plan_grab.py plan --x 15 --y 45 --slot 11 --dry-run  # 한 지점 미리보기
+./plan_grab.py grid --slots 6-47 --x-range -30 30 --y-range 10 70
+./plan_grab.py nearest --board 12.5,-8                 # 비전 좌표 → 재생할 슬롯
+```
+
+인터페이스와 제약, 그리고 **사용자가 실측해야 하는 항목**은
+[VISION_INTERFACE.md](features/grab_planner/VISION_INTERFACE.md) 에 정리돼 있습니다.
+핵심만 옮기면:
+
+- 이 로봇은 **그리퍼가 없고**, grab 은 양팔이 물체를 양옆에서 무는 대칭 핀치입니다.
+  집는 순간 간격이 60mm 이므로 **집는 축 방향 물체 폭이 60mm 보다 커야** 물립니다.
+- 손목이 없어 EE 는 못 돌리지만, 두 팔의 목표점을 회전시켜 **집는 축 방향**은
+  바꿀 수 있습니다 (`--grip-angle`).
+- **실시간 루프는 불가능합니다.** 이 로봇은 미리 SD 에 적재된 슬롯만 재생합니다.
+  액션도 내부 서비스도 슬롯 ID 만 받고, RT 관절 스트리밍은 해커톤 구성에서
+  꺼져 있습니다(`PhorceCommand.msg` 주석: *"pcm ctrl frame 자체가 나가지 않는다"*).
+  → 미리 격자로 슬롯을 깔고 가장 가까운 것을 고르는 방식(방식 A)이 현실적입니다.
+- 빈 슬롯 42개로 덮을 수 있는 영역은 **약 60×60mm (최대 오차 7.1mm)** 입니다.
+
+`out/` 과 `slot_grid.json` 은 생성물이라 git 에 넣지 않습니다. 위 `grid` 명령으로
+언제든 다시 만들 수 있습니다.
+
 ## 테스트
 
 ```bash
-./dev/tests/test_catalog_naming.sh
+./dev/tests/test_catalog_naming.sh      # motion_dir 이 슬롯 이름을 붙이는가
+python3 dev/tests/test_grab_planner.py  # 기구학·CSV 포맷·플랜·좌표변환 (29개)
+./dev/tests/test_grab_sim_e2e.sh        # 비전좌표 → CSV → sim 재생 종단 검증
 ```
 
 ## 이 워크스페이스가 이미 밝혀낸 것
