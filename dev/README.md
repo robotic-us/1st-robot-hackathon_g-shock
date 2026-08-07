@@ -22,9 +22,25 @@
 
 ```bash
 cd ~/g-shock-dev
-source dev/env.sh          # 환경 (domain, namespace, 경로)
-./dev/bin/doctor.sh        # 실기·sim·카탈로그·안전 상태 한 장
+source dev/env.sh          # 환경 (domain 21, namespace, 경로)
+./dev/bin/doctor.sh        # 실기·sim·카탈로그·domain 충돌·안전 상태 한 장
 ```
+
+## domain 은 반드시 21 — domain 0 금지
+
+이 장비는 공유 WiFi(`10.249.184.0/24`)에 붙어 있고 `ROS_LOCALHOST_ONLY=0` 이라
+**ROS 그래프가 네트워크 전체로 퍼집니다.** domain 0 은 모두의 기본값이라, 0 으로 띄우면
+같은 해커톤 네트워크의 **다른 팀 로봇과 그래프가 합쳐집니다.**
+
+실기 스택은 이 래퍼로 띄우세요. domain 21 을 보장하고, 0 이면 아예 거부합니다.
+
+```bash
+./dev/bin/robot-stack.sh              # = check_robot_communication.sh + domain 21
+phorce list --domain-id 21            # 조회
+```
+
+셸에 `source dev/env.sh` 를 했다면 `ROS_DOMAIN_ID=21` 이 이미 잡혀 있어서
+`--domain-id 21` 없이 `phorce list` 만 해도 같습니다. 두 방법 다 됩니다.
 
 ## sim 에서 안전하게 테스트
 
@@ -73,6 +89,27 @@ sim 은 `/sim/<세션>` namespace 로 뜨므로 실기(root namespace)와 **같�
 별칭 목록에 없고, `TAPE` 와 `HOME` 계열 슬롯은 아예 만들어진 적이 없습니다.
 별칭 표를 고치거나 해당 모션을 만들어야 합니다.
 
+**3. `phorce list` 가 남의 팀 로봇을 보여주던 문제 (2026-08-07).** 슬롯 개수가 호출할
+때마다 8개 → 26개 → 1개로 튀는 현상이 있었습니다. 로봇이 바뀐 게 아니라 스택이
+domain 0 으로 떠 있어서 **다른 팀 서버가 번갈아 응답**한 것입니다.
+
+- 로컬 `motion_action_server` 프로세스는 1개인데 그래프에는 3개가 보였습니다.
+- `motion_action_server` 가 `10.249.184.90`(공유 WiFi)에 바인딩돼 있었습니다.
+- `eno1`(로봇 EtherCAT)은 IP 가 없어 원격 경로가 아닙니다.
+
+우리 로봇의 진짜 슬롯은 `phorce_monitor` 가 기동 시 PCM 에서 직접 읽습니다.
+네트워크를 안 타므로 이 값이 신뢰할 수 있는 기준입니다.
+
+```
+모션 창구 확인 — playable 1..50, ... 적재 슬롯 마스크 0x000700000000003E
+  → 슬롯 [1, 2, 3, 4, 5, 48, 49, 50] = 8개
+```
+
+원인은 `main/check_robot_communication.sh` 에 `ROS_DOMAIN_ID` 설정이 없다는 것입니다
+(`main/run_integrated_system.sh` 에는 21 이 있습니다). `dev/bin/robot-stack.sh` 가 이걸
+메웁니다. `dev/bin/doctor.sh` 는 그래프의 서버 수가 로컬 프로세스 수보다 많으면
+경고하므로 재발을 바로 잡아냅니다.
+
 ## ⚠️ 실물 안전
 
 `logs/motion_action_server.log` 기준으로 **pcm 은 EtherCAT 정지를 지원하지 않습니다.**
@@ -91,8 +128,8 @@ sim 은 `/sim/<세션>` namespace 로 뜨므로 실기(root namespace)와 **같�
 
 ```
 dev/
-├── env.sh       source 해서 쓰는 공통 환경
-├── bin/         sim-up.sh · sim-down.sh · doctor.sh
+├── env.sh       source 해서 쓰는 공통 환경 (domain 21)
+├── bin/         robot-stack.sh · sim-up.sh · sim-down.sh · doctor.sh
 ├── catalog/     motion_dir 로 넘길 평면 카탈로그 (motion_NN.csv + memo)
 ├── features/    새 기능 코드 — 여기에 만드세요
 ├── tests/       테스트 스크립트

@@ -13,11 +13,33 @@ ok "catalog   $PHORCE_CATALOG ($(ls "$PHORCE_CATALOG"/motion_*.csv 2>/dev/null |
 ok "baseline  $PHORCE_BASELINE (읽기 참조용 — 여기서 고치지 말 것)"
 
 printf '\n== domain ==\n'
-ok "ROS_DOMAIN_ID=$ROS_DOMAIN_ID (robot=$PHORCE_ROBOT_DOMAIN_ID sim=$PHORCE_SIM_DOMAIN_ID)"
-legacy="$(grep -oE 'ROS_DOMAIN_ID:-[0-9]+' "$PHORCE_BASELINE/run_integrated_system.sh" 2>/dev/null | head -1 | cut -d- -f3)"
-if [[ -n "$legacy" && "$legacy" != "$ROS_DOMAIN_ID" ]]; then
-  warn "main/run_integrated_system.sh 는 domain $legacy 을 강제합니다. 지금 이 셸($ROS_DOMAIN_ID)과 다르므로"
-  warn "두 스택을 섞어 띄우면 서로를 못 봅니다."
+ok "이 셸: ROS_DOMAIN_ID=$ROS_DOMAIN_ID (robot=$PHORCE_ROBOT_DOMAIN_ID sim=$PHORCE_SIM_DOMAIN_ID)"
+
+# 이 장비는 공유 WiFi 에 붙어 있고 ROS_LOCALHOST_ONLY=0 이므로 ROS 그래프가
+# 네트워크 전체로 퍼진다. domain 0 은 모두의 기본값이라 반드시 피해야 한다.
+if [[ "${ROS_LOCALHOST_ONLY:-0}" == "0" ]]; then
+  shared_if="$(ip -4 -br addr 2>/dev/null | awk '$1!="lo" && $3!="" {print $1" "$3}' | grep -v docker | head -1)"
+  [[ -n "$shared_if" ]] && ok "그래프가 네트워크로 퍼짐: $shared_if (ROS_LOCALHOST_ONLY=0)"
+fi
+
+# 실기 스택이 실제로 어느 domain 에 있는지 훑는다.
+printf '  domain 탐색:\n'
+for d in 0 "$PHORCE_ROBOT_DOMAIN_ID"; do
+  graph="$(ROS_DOMAIN_ID="$d" timeout 8s ros2 node list 2>/dev/null | grep -c '^/motion_action_server$')"
+  printf '    domain %-3s → /motion_action_server %s개\n' "$d" "${graph:-0}"
+  if [[ "$d" == "0" && "${graph:-0}" -gt 0 ]]; then
+    warn "domain 0 에 노드가 보입니다. 0 은 모든 팀의 기본값이라 남의 로봇과 그래프가 섞입니다."
+  fi
+done
+
+# 그래프의 서버 수 > 로컬 프로세스 수 이면 남의 장비가 섞인 것이다.
+local_n="$(pgrep -fc '/agx_motion_slot/motion_action_server' 2>/dev/null || echo 0)"
+graph_n="$(timeout 8s ros2 node list 2>/dev/null | grep -c '^/motion_action_server$')"
+ok "motion_action_server — 로컬 프로세스 ${local_n}개 / domain $ROS_DOMAIN_ID 그래프 ${graph_n:-0}개"
+if [[ "${graph_n:-0}" -gt "${local_n:-0}" ]]; then
+  warn "그래프에 로컬보다 많은 서버가 보입니다 — 다른 팀 장비가 같은 domain 에 섞여 있습니다."
+  warn "이 상태의 phorce list 는 남의 로봇 카탈로그를 돌려줄 수 있고,"
+  warn "phorce play 는 남의 로봇을 움직일 수 있습니다. domain 을 격리하기 전엔 play 금지."
 fi
 
 printf '\n== 실기(robot) 상태 ==\n'

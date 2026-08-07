@@ -23,11 +23,19 @@ if [[ -f /opt/ros/humble/setup.bash ]]; then
 fi
 
 # ── domain ──────────────────────────────────────────────────────────────────
-# 주의: main/run_integrated_system.sh 는 ROS_DOMAIN_ID=21 을 강제하지만,
-# 2026-08-07 실기 검증에 실제로 쓰인 노드들은 ROS_DOMAIN_ID 미설정(=0)으로
-# 떠 있었다. 여기서는 0 으로 고정한다. 21 로 옮기려면 아래 세 값을 함께 바꾸고
-# dev/bin/doctor.sh 로 노드가 같은 domain 에 있는지 확인할 것.
-export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
+# 반드시 21. domain 0 을 쓰면 안 된다.
+#
+# 이 장비는 공유 WiFi(10.249.184.0/24)에 붙어 있고 ROS_LOCALHOST_ONLY=0 이라
+# ROS 그래프가 네트워크 전체로 퍼진다. 2026-08-07 에 스택이 domain 0(기본값)으로
+# 떠 있었더니 같은 해커톤 네트워크의 다른 팀 로봇과 그래프가 합쳐져서,
+# `phorce list` 가 호출할 때마다 남의 로봇 카탈로그를 돌려줬다(슬롯 8개 → 26개 → 1개).
+# 조회만 그런 게 아니라 `phorce play` 가 남의 로봇을 움직일 수 있는 상태였다.
+# pcm 은 cancel 을 거부하므로 잘못 나간 모션은 끝까지 완주한다.
+#
+# main/run_integrated_system.sh 는 21 을 강제하지만
+# main/check_robot_communication.sh 에는 그 줄이 없어서, 후자로 띄우면 0 으로 샌다.
+# 실기 스택은 dev/bin/robot-stack.sh 로 띄우면 21 이 보장된다.
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-21}"
 export PHORCE_ROBOT_DOMAIN_ID="${PHORCE_ROBOT_DOMAIN_ID:-$ROS_DOMAIN_ID}"
 export PHORCE_SIM_DOMAIN_ID="${PHORCE_SIM_DOMAIN_ID:-$ROS_DOMAIN_ID}"
 
