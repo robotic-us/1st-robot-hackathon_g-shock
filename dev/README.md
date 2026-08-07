@@ -61,6 +61,27 @@ phorce status --target sim:dev
 sim 은 `/sim/<세션>` namespace 로 뜨므로 실기(root namespace)와 **같은 domain 을 써도
 충돌하지 않습니다**. 실기 스택을 띄운 채로 sim 을 병행해도 됩니다.
 
+## vision — 펙보드 위 물체의 mm 좌표·자세
+
+`dev/features/vision/` 에 있습니다. USB 웹캠으로 펙보드 타공 격자를 읽어 픽셀↔mm
+매핑을 만들고, 보드 위 물체의 평면 좌표와 자세를 실시간으로 냅니다. 고전 CV 만
+쓰며 딥러닝 모델은 없습니다.
+
+```bash
+cd dev/features/vision
+./setup_venv.sh                                              # 최초 1회
+./venv/bin/python src/pegboard.py data/frames/warm.jpg --pitch-mm 10   # 캘리브레이션
+PYTHONPATH=src ./venv/bin/python src/live.py --headless      # 실시간 검출
+```
+
+실측 성능은 **5.9 ms/frame**, 매핑 잔차 중앙값 **0.120 mm**, 위치 재현성 **0.16 mm**
+입니다. 카메라가 15~20 fps 로 상한이라 처리 쪽은 여유가 많습니다.
+
+**좌표 원점이 아직 임의의 구멍이라 출력이 음수로 나옵니다.** 이 좌표를 로봇에
+넘기려면 비전↔로봇 좌표 변환을 한 번 실측해야 합니다 (아래 VISION_INTERFACE.md 2절).
+
+`venv/` `.bootstrap/` `out/` 은 생성물이라 git 에 넣지 않습니다.
+
 ## grab_planner — 비전 좌표로 양팔 grab 모션 만들기
 
 `dev/features/grab_planner/` 에 있습니다. 비전이 준 물체 위치를 받아 양팔 핀치
@@ -164,6 +185,8 @@ dev/
 ├── bin/         robot-stack.sh · sim-up.sh · sim-down.sh · doctor.sh
 ├── catalog/     motion_dir 로 넘길 평면 카탈로그 (motion_NN.csv + memo)
 ├── features/    새 기능 코드 — 여기에 만드세요
+│   ├── vision/        웹캠 → 펙보드 mm 좌표·자세
+│   └── grab_planner/  mm 좌표 → 양팔 grab 모션 슬롯
 ├── tests/       테스트 스크립트
 └── logs/        런타임 로그·pidfile (git 무시)
 ```
