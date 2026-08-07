@@ -1,0 +1,27 @@
+{
+  "robot_id": 1,
+  "robot_uid": "0046003E3133511832353236",
+  "known_mask": 455,
+  "active_md_ids": [0, 1, 2, 6, 7, 8],
+  "kinematics": {
+    "base_height_mm": 110.6,
+    "base_separation_mm": 350.0,
+    "link_1_mm": 100.0,
+    "link_2_to_tip_mm": 120.0,
+    "groups": {
+      "ARM A (MD0/1/2)": {"md_ids": [0, 1, 2], "sign": [1, 1, -1], "offset_deg": [128.7, 15.3, 119.7]},
+      "ARM B (MD8/6/7)": {"md_ids": [8, 6, 7], "sign": [1, 1, 1], "offset_deg": [-129.1, 15.8, -120.1]}
+    },
+    "button1_ready_geometric_deg": [0.0, 90.0, -90.0],
+    "button1_ready_motor_deg": {
+      "ARM A (MD0/1/2)": [128.7, 105.3, 209.7],
+      "ARM B (MD8/6/7)": [-129.1, 105.8, -210.1]
+    }
+  },
+  "zero_offset_f32_le_hex": [
+    "f953e3bf", "7f6a843f", "07813540",
+    null, null, null,
+    "1d5a2440", "77bedf3f", "a245c63f",
+    null, null, null
+  ]
+}

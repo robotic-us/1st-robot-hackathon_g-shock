@@ -1,0 +1,12 @@
+logs/*.log
+logs/*.pid
+features/grab_planner/out/
+features/grab_planner/slot_grid.json
+features/grab_planner/calibration.json
+features/grab_planner/__pycache__/
+features/vision/venv/
+features/vision/.bootstrap/
+features/vision/out/
+features/vision/__pycache__/
+features/vision/src/__pycache__/
+features/vision/data/frames/snap_*.jpg
