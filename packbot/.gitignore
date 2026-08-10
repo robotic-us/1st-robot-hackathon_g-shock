@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Third-party model weights are reproducible dependencies, not project source.
+models/*.pt
+
+# Local editor and OS metadata.
+.idea/
+.vscode/
+.DS_Store
