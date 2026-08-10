@@ -38,6 +38,7 @@ MOTION_SLOT_IDS = {
     "grab": 4,
 }
 ALLOWED_MOTION_IDS = frozenset(MOTION_SLOT_IDS.values())
+MANUAL_MOTION_IDS = ALLOWED_MOTION_IDS | {50}
 PARK_MOTION_ID = 1
 # /phorce/feedback.position_rad reference poses from operator captures.
 # HOME_ZERO_RAD is the unprepared home-zero pose; BUTTON1_READY_RAD is the pose
@@ -532,6 +533,7 @@ class GuardApp:
         style = ttk.Style()
         style.configure("Title.TLabel", font=("Sans", 20, "bold"))
         style.configure("State.TLabel", font=("Sans", 15, "bold"))
+        style.configure("Motion.TButton", padding=(6, 4))
 
         frame = ttk.Frame(root, padding=18)
         frame.pack(fill="both", expand=True)
@@ -570,6 +572,11 @@ class GuardApp:
 
         controls = ttk.LabelFrame(frame, text="실행 설정", padding=12)
         controls.pack(fill="x")
+        # Keep every control row constrained to the available client width.
+        # Without weighted columns, a long status/voice label can enlarge this
+        # frame's requested width and push the manual motion buttons off-screen.
+        for col in range(3):
+            controls.columnconfigure(col, weight=1, uniform="controls")
         self.threshold = tk.StringVar(value="2.0")
         self.hits = tk.StringVar(value="3")
         self.manual_motion_id = tk.StringVar(value="1")
@@ -608,9 +615,10 @@ class GuardApp:
                                             ("grab", "GRAB"))):
             button = ttk.Button(motion_buttons, text=label,
                                 command=lambda selected=key: self.play_motion(selected),
-                                state="disabled")
-            button.grid(row=0, column=col, sticky="ew", padx=3)
-            motion_buttons.columnconfigure(col, weight=1)
+                                state="disabled", style="Motion.TButton")
+            button.grid(row=0, column=col, sticky="ew", padx=2)
+            motion_buttons.columnconfigure(
+                col, weight=1, uniform="motion_buttons", minsize=0)
             self.motion_buttons[key] = button
         self.catalog_label = ttk.Label(controls, text="PCM 모션 목록 대기 중")
         self.catalog_label.grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=(4, 0))
@@ -671,18 +679,18 @@ class GuardApp:
         self.motor_label = ttk.Label(status, text="감지 모터 ID: -")
         self.motor_label.pack(anchor="w", pady=(2, 0))
 
-        axes_box = ttk.LabelFrame(frame, text="축별 실시간 값", padding=10)
+        axes_box = ttk.LabelFrame(frame, text="축별 실시간 값 · 사용 축 6개", padding=10)
         axes_box.pack(fill="both", expand=True)
         ttk.Label(axes_box, text="각도 표시: 시작 홈 영점 오프셋 적용됨 (홈 기준 최단 각도차)").pack(anchor="w", pady=(0, 5))
         self.tree = ttk.Treeview(axes_box, columns=("valid", "position", "dob", "current", "bar"),
-                                 show="headings", height=12)
+                                 show="headings", height=len(ACTIVE_AXES))
         for key, title, size in (("valid", "유효", 55), ("position", "홈 기준 각도 (rad)", 125),
                                  ("dob", "DOB (A)", 90), ("current", "전류 (A)", 90),
                                  ("bar", "임계값 대비", 210)):
             self.tree.heading(key, text=title)
             self.tree.column(key, width=size, anchor="center")
         self.tree.pack(fill="both", expand=True)
-        for i in range(12):
+        for i in ACTIVE_AXES:
             self.tree.insert("", "end", iid=str(i), values=("-", "-", "-", "-", ""))
 
         warning = tk.Label(frame, text="DOB 3.0A 초과 시 USB 즉시 OFF를 요청합니다. 위험 시 반드시 물리 E-Stop을 사용하세요.",
@@ -787,12 +795,13 @@ class GuardApp:
             motion_id = int(self.manual_motion_id.get())
             threshold = float(self.threshold.get())
             hits = int(self.hits.get())
-            if motion_id not in ALLOWED_MOTION_IDS or threshold <= 0 or hits < 1:
+            if motion_id not in MANUAL_MOTION_IDS or threshold <= 0 or hits < 1:
                 raise ValueError
         except ValueError:
             messagebox.showerror(
                 "입력 오류",
-                "허용 모션 ID는 1(HOME), 3(BOX), 4(GRAB)입니다. "
+                "직접 실행 가능한 모션 ID는 1(HOME), 3(BOX), 4(GRAB), "
+                "50(빠른 박스 접기)입니다. "
                 "양수 임계값과 연속 프레임 1 이상을 입력하세요.")
             return
         self.node.request_play(motion_id, threshold, hits)
@@ -954,6 +963,8 @@ class GuardApp:
             else:
                 button.configure(state="disabled")
         for index, position, dob, current, valid in axes:
+            if index not in ACTIVE_AXES:
+                continue
             ratio = min(abs(dob) / threshold, 1.0) if threshold else 0
             bar = "█" * int(ratio * 20)
             self.tree.item(str(index), values=("OK" if valid else "무효",
