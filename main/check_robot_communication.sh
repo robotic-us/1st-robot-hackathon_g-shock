@@ -6,11 +6,14 @@ set -u
 NIC="${PHORCE_NIC:-eno1}"
 MODE="${PHORCE_MODE:-op_idle}"
 AXES="${PHORCE_AXES:-auto}"
+MOTION_DIR="${PHORCE_MOTION_DIR:-/media/phorce/9016-4EF8/Motions}"
 STARTUP_TIMEOUT="${PHORCE_STARTUP_TIMEOUT:-20}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
 MONITOR_LOG="${LOG_DIR}/phorce_monitor.log"
 ACTION_LOG="${LOG_DIR}/motion_action_server.log"
+FEEDBACK_PROBE_LOG="${LOG_DIR}/feedback_probe.log"
+COMM_STATUS_FILE="${PHORCE_COMM_STATUS_FILE:-}"
 MONITOR_PID=""
 ACTION_PID=""
 CLEANED_UP=0
@@ -19,8 +22,14 @@ TOTAL_STEPS=6
 
 info() { printf '[INFO] %s\n' "$*"; }
 pass() { printf '[PASS] %s\n' "$*"; }
+publish_status() {
+  if [[ -n "$COMM_STATUS_FILE" ]]; then
+    printf '%s\n' "$1" >"$COMM_STATUS_FILE"
+  fi
+}
 fail() {
   finish_progress_line
+  publish_status "FAILED"
   printf '[FAIL] %s\n' "$*" >&2
 }
 
@@ -77,6 +86,8 @@ on_interrupt() {
 
 trap cleanup EXIT
 trap on_interrupt INT TERM
+
+publish_status "STARTING"
 
 wait_for_graph_name() {
   local kind="$1"
@@ -136,6 +147,12 @@ if ! command -v ros2 >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ ! -d "$MOTION_DIR" ]]; then
+  fail "모션 디렉터리를 찾을 수 없습니다: ${MOTION_DIR}"
+  fail "PCM SD카드가 마운트됐는지 확인하거나 PHORCE_MOTION_DIR를 지정하세요."
+  exit 1
+fi
+
 progress 2 "ROS 2 실행 파일 확인"
 for spec in \
   "agx_phorce_bridge phorce_monitor" \
@@ -150,6 +167,7 @@ done
 mkdir -p "$LOG_DIR"
 : >"$MONITOR_LOG"
 : >"$ACTION_LOG"
+: >"$FEEDBACK_PROBE_LOG"
 
 progress 3 "피드백 토픽 연결"
 ros2 run agx_phorce_bridge phorce_monitor --ros-args \
@@ -183,16 +201,25 @@ else
 fi
 
 progress 5 "실제 피드백 수신 확인"
-if timeout 5s ros2 topic echo /phorce/feedback --once >/dev/null 2>&1; then
+if timeout 10s ros2 topic echo --no-daemon --qos-profile sensor_data \
+    /phorce/feedback agx_msgs/msg/PhorceFeedback --once \
+    >/dev/null 2>"$FEEDBACK_PROBE_LOG"; then
   :
 else
-  fail "토픽은 있지만 5초 안에 피드백을 받지 못했습니다."
+  result=$?
+  if (( result == 124 )); then
+    fail "토픽은 있지만 10초 안에 피드백을 받지 못했습니다."
+  else
+    fail "피드백 확인 명령이 조기에 종료되었습니다 (종료 코드 ${result})."
+    show_log_hint "$FEEDBACK_PROBE_LOG"
+  fi
   show_log_hint "$MONITOR_LOG"
   exit 1
 fi
 
 progress 6 "액션 서버 연결"
-ros2 run agx_motion_slot motion_action_server --ros-args -p backend:=ecat \
+ros2 run agx_motion_slot motion_action_server --ros-args \
+  -p backend:=ecat -p "motion_dir:=${MOTION_DIR}" \
   >"$ACTION_LOG" 2>&1 &
 ACTION_PID=$!
 
@@ -213,6 +240,7 @@ finish_progress_line
 pass "통신 정상: 링크, 피드백, 자가검사(${PASS_COUNT}개), 액션 서버"
 info "모션 goal 미전송 · 노드 유지 중 (종료: Ctrl+C)"
 info "로그: ${MONITOR_LOG}, ${ACTION_LOG}"
+publish_status "READY"
 
 while kill -0 "$MONITOR_PID" 2>/dev/null && kill -0 "$ACTION_PID" 2>/dev/null; do
   sleep 1
